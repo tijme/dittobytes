@@ -91,72 +91,70 @@ public:
     bool run(Module &M, ModuleAnalysisManager &) {
         // Ensure module is enabled
         if (!moduleIsEnabled()) return false;
-        
+
         // Inform user that we are running this module
         dbgs() << "        ↳ Running MoveGlobalsToStackModule module.\n";
 
-        SmallMapVector<Function *, SmallSetVector<GlobalVariable *, 4>, 4> usage;
+        // Build: global → all functions using it
+        SmallMapVector<GlobalVariable *, SmallSetVector<Function *, 4>, 4> globalsToFunctions;
 
         for (GlobalVariable &G : M.globals()) {
-            if (shouldInline(G)) {
-                usage[getUsingFunction(G)].insert(&G);
-            }
+            if (!G.isDiscardableIfUnused()) continue;
+            SmallSetVector<Function *, 4> funcs;
+            if (collectUsingFunctions(G, funcs) && !funcs.empty())
+                globalsToFunctions[&G] = std::move(funcs);
         }
 
-        for (auto &KV : usage) {
+        if (globalsToFunctions.empty()) return false;
+
+        // Build reverse map: function → globals to inline into it
+        SmallMapVector<Function *, SmallSetVector<GlobalVariable *, 4>, 4> usage;
+        for (auto &KV : globalsToFunctions)
+            for (Function *F : KV.second)
+                usage[F].insert(KV.first);
+
+        // Create a per-function stack copy for each global
+        for (auto &KV : usage)
             inlineGlobals(M, KV.first, KV.second);
-        }
 
-        return !usage.empty();
+        // Erase globals that are now fully replaced
+        for (auto &KV : globalsToFunctions)
+            if (KV.first->use_empty())
+                KV.first->eraseFromParent();
+
+        return true;
     }
 
 private:
 
-    Function * getUsingFunction(Value & V) {
-        Function * F = nullptr;
+    // Collect every Function that (directly or transitively through ConstantExprs)
+    // uses V. Returns false if a non-inlinable user (non-discardable GlobalVariable
+    // or non-Instruction) is found, meaning the global cannot be moved to the stack.
+    bool collectUsingFunctions(Value &V, SmallSetVector<Function *, 4> &Functions) {
+        SmallVector<User *, 4> Worklist;
+        SmallSet<User *, 4> Visited;
 
-        SmallVector < User * , 4 > Worklist;
-        SmallSet < User * , 4 > Visited;
-
-        for (auto * U: V.users())
+        for (auto *U : V.users())
             Worklist.push_back(U);
+
         while (!Worklist.empty()) {
-            auto * U = Worklist.pop_back_val();
+            auto *U = Worklist.pop_back_val();
 
-            if (Visited.count(U))
-                continue;
-            else
-                Visited.insert(U);
+            if (Visited.count(U)) continue;
+            Visited.insert(U);
 
-            if (isa < ConstantExpr > (U) || isa < ConstantAggregate > (U) ||
-                isa < GlobalVariable > (U)) {
-                if (isa < GlobalVariable > (U) &&
-                    !cast < GlobalVariable > (U) -> isDiscardableIfUnused())
-                    return nullptr;
-                for (auto * UU: U -> users()) {
+            if (isa<ConstantExpr>(U) || isa<ConstantAggregate>(U) || isa<GlobalVariable>(U)) {
+                if (isa<GlobalVariable>(U) && !cast<GlobalVariable>(U)->isDiscardableIfUnused())
+                    return false;
+                for (auto *UU : U->users())
                     Worklist.push_back(UU);
-                }
                 continue;
             }
 
-            auto * I = dyn_cast < Instruction > (U);
-            if (!I)
-                return nullptr;
-            if (!F)
-                F = I -> getParent() -> getParent();
-            if (I -> getParent() -> getParent() != F)
-                return nullptr;
+            auto *I = dyn_cast<Instruction>(U);
+            if (!I) return false;
+            Functions.insert(I->getParent()->getParent());
         }
-
-        return F;
-    }
-
-    bool shouldInline(GlobalVariable & G) {
-        if (!G.isDiscardableIfUnused())
-            return false; // Goal is to discard these; ignore if that's not possible
-
-        if (!getUsingFunction(G))
-            return false; // This isn't safe. We can only be on one function's stack.
 
         return true;
     }
@@ -272,7 +270,6 @@ private:
                 if (G -> hasInitializer()) {
                     Constant * initializer = G -> getInitializer();
                     StoreInst * store = new StoreInst(initializer, inst, insertionPoint);
-                    G -> setInitializer(nullptr);
 
                     extractValuesFromStore(store, Vars);
 
@@ -286,20 +283,20 @@ private:
             
         }
 
-        // Replace all uses of globals with their alloca pointers
+        // Replace uses of each global within F only (other functions get their own copy)
         for (auto *G : Vars) {
             if (!Replacements.count(G))
                 continue;
-            
+
             Value *replacement = Replacements[G];
 
             SmallVector<User *, 8> users(G->users());
             for (User *U : users) {
                 if (auto *CE = dyn_cast<ConstantExpr>(U)) {
-                    // For constant expr users, replace their uses recursively
                     SmallVector<User *, 8> CEUsers(CE->users());
                     for (User *CEUser : CEUsers) {
                         if (Instruction *I = dyn_cast<Instruction>(CEUser)) {
+                            if (I->getParent()->getParent() != F) continue;
                             IRBuilder<> ib(I);
                             Value *replacementVal = CE;
                             if (CE->getOpcode() == Instruction::BitCast) {
@@ -309,11 +306,11 @@ private:
                         }
                     }
                 } else if (Instruction *I = dyn_cast<Instruction>(U)) {
+                    if (I->getParent()->getParent() != F) continue;
                     I->replaceUsesOfWith(G, replacement);
                 }
             }
-
-            G->eraseFromParent();
+            // Do not erase G here — run() erases it once all functions are done
         }
     }
 
